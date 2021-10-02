@@ -1,6 +1,7 @@
-import express from 'express';
+import express, {Application} from 'express';
 import http from 'http';
-import {MongoClient, ObjectId} from 'mongodb';
+import {MongoClient, ObjectId, Db} from 'mongodb';
+import amqp from 'amqplib';
 
 const app = express();
 
@@ -34,6 +35,12 @@ if (!process.env.DBNAME) {
 	);
 }
 
+if (!process.env.RABBIT) {
+	throw new Error(
+		'Please specify the name of the RabbitMQ host using environment variable RABBIT'
+	);
+}
+
 //
 // Extracts environment variables to globals for convenience.
 //
@@ -42,20 +49,57 @@ const VIDEO_STORAGE_HOST = process.env.VIDEO_STORAGE_HOST;
 const VIDEO_STORAGE_PORT = parseInt(process.env.VIDEO_STORAGE_PORT);
 const DBHOST = process.env.DBHOST;
 const DBNAME = process.env.DBNAME;
+const RABBIT = process.env.RABBIT;
 console.log(
 	`Forwarding video requests to ${VIDEO_STORAGE_HOST}:${VIDEO_STORAGE_PORT}.`
 );
 
-async function main() {
-	// Connect to the database.
+//
+// Connect to the database.
+//
+async function connectDb() {
 	const client = await MongoClient.connect(DBHOST);
-	const db = client.db(DBNAME);
+	return client.db(DBNAME);
+}
+
+//
+// Connect to the RabbitMQ server.
+//
+async function connectRabbit() {
+	console.log(`Connecting to RabbitMQ server at ${RABBIT}.`);
+	// Connect to the RabbitMQ server.
+	const connection = await amqp.connect(RABBIT);
+	console.log('Connected to RabbitMQ.');
+	const messageChannel = await connection.createChannel(); // Create a RabbitMQ messaging channel.
+	await messageChannel.assertExchange('viewed', 'fanout'); // Assert that we have a "viewed" exchange.
+	return messageChannel;
+}
+
+//
+// Send the "viewed" to the history microservice.
+//
+function sendViewedMessage(messageChannel: amqp.Channel, videoPath: string) {
+	console.log(`Publishing message on "viewed" exchange.`);
+
+	const msg = {videoPath: videoPath};
+	const jsonMsg = JSON.stringify(msg);
+	messageChannel.publish('', 'viewed', Buffer.from(jsonMsg)); // Publish message to the "viewed" queue.
+}
+
+//
+// Setup route handlers.
+//
+async function setupHandlers(
+	app: Application,
+	db: Db,
+	messageChannel: amqp.Channel
+) {
 	const videosCollection = db.collection('videos');
 	//
 	// Registers a HTTP GET route for video streaming.
 	//
-	app.get('/video', (req_1: express.Request, res: express.Response) => {
-		const videoId = new ObjectId(req_1.query.id as string);
+	app.get('/video', (req: express.Request, res: express.Response) => {
+		const videoId = new ObjectId(req.query.id as string);
 		videosCollection
 			.findOne({_id: videoId})
 			.then((videoRecord) => {
@@ -75,7 +119,7 @@ async function main() {
 						port: VIDEO_STORAGE_PORT,
 						path: `/video?path=${videoRecord.videoPath}`,
 						method: 'GET',
-						headers: req_1.headers,
+						headers: req.headers,
 					},
 					(forwardResponse) => {
 						res.writeHead(
@@ -83,10 +127,14 @@ async function main() {
 							forwardResponse.headers
 						);
 						forwardResponse.pipe(res);
+						sendViewedMessage(
+							messageChannel,
+							videoRecord.videoPath
+						);
 					}
 				);
 
-				req_1.pipe(forwardRequest);
+				req.pipe(forwardRequest);
 			})
 			.catch((err) => {
 				console.error('Database query failed.');
@@ -94,14 +142,33 @@ async function main() {
 				res.sendStatus(500);
 			});
 	});
-	//
-	// Starts the HTTP server.
-	//
-	app.listen(PORT, () => {
-		console.log(
-			`Microservice listening, please load the data file db-fixture/videos.json into your database before testing this microservice.`
-		);
+}
+
+//
+// Start the HTTP server.
+//
+function startHttpServer(db: Db, messageChannel: amqp.Channel) {
+	// Wrap in a promise so we can be notified when the server has started.
+	return new Promise<void>((resolve) => {
+		const app = express();
+		setupHandlers(app, db, messageChannel);
+
+		app.listen(PORT || 3000, () => {
+			resolve(); // HTTP server is listening, resolve the promise.
+		});
 	});
+}
+
+//
+// Application entry point.
+//
+async function main() {
+	console.log('Hello world!');
+	// Connect to the database...
+	const db = await connectDb();
+	// connect to RabbitMQ...
+	const messageChannel = await connectRabbit();
+	return startHttpServer(db, messageChannel);
 }
 
 main()
